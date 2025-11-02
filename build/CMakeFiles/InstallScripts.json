@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/owen/dev/pixi/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
