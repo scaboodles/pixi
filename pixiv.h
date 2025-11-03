@@ -17,14 +17,14 @@ typedef struct {
     int width;
     int height;
     double fps;
-    unsigned char ***pixel_buffer;  // Reusable buffer to avoid per-frame allocation hell
+    unsigned char *pixel_buffer;  // Flat array: width * height * 3 bytes
 } VideoDecoder;
 
 // open video file and set up decoder
 // NULL on error
 VideoDecoder* video_decoder_open(const char *path);
 
-unsigned char*** video_decoder_next_frame(VideoDecoder *decoder);
+unsigned char* video_decoder_next_frame(VideoDecoder *decoder);
 
 void video_decoder_close(VideoDecoder *decoder);
 

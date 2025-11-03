@@ -12,6 +12,8 @@
 #include <sys/time.h>
 #include "pixiv.h"
 
+#define PIXEL(pixels, width, x, y, c) ((pixels)[((y) * (width) + (x)) * 3 + (c)])
+
 // shutdown flag
 volatile sig_atomic_t should_exit = 0;
 
@@ -65,7 +67,7 @@ FileType detect_file_type(const char *path) {
     return FILE_TYPE_UNKNOWN;
 }
 
-unsigned char*** decode_jpeg(const char *path, int *width, int *height){
+unsigned char* decode_jpeg(const char *path, int *width, int *height){
     FILE * f = fopen(path, "rb");
     if(!f){
         perror("invalid path");
@@ -85,22 +87,16 @@ unsigned char*** decode_jpeg(const char *path, int *width, int *height){
     *height = decomp.output_height;
     int num_channel = decomp.output_components;
 
-    unsigned char ***pixels = malloc(*height * sizeof(unsigned char**));
-    for(int y = 0; y < *height; y++){
-        pixels[y] = malloc(*width * sizeof(unsigned char*));
-        for(int x = 0; x < *width; x++){
-            pixels[y][x] = malloc(3 * sizeof(unsigned char));
-        }
-    }
+    unsigned char *pixels = malloc(*width * *height * 3);
 
     unsigned char *row = malloc(*width * num_channel);
     while(decomp.output_scanline < *height){
         int y = decomp.output_scanline;
         jpeg_read_scanlines(&decomp, &row, 1);
         for(int x = 0; x < *width; x++){
-            pixels[y][x][0] = row[x*num_channel + 0];
-            pixels[y][x][1] = row[x*num_channel + 1];
-            pixels[y][x][2] = row[x*num_channel + 2];
+            PIXEL(pixels, *width, x, y, 0) = row[x*num_channel + 0];
+            PIXEL(pixels, *width, x, y, 1) = row[x*num_channel + 1];
+            PIXEL(pixels, *width, x, y, 2) = row[x*num_channel + 2];
         }
     }
 
@@ -135,26 +131,24 @@ void calculate_scaled_dimensions(int width, int height, int term_width, int term
     }
 }
 
-unsigned char*** downscale_image(unsigned char ***pixels, int width, int height, int scaled_width, int scaled_height){
-    unsigned char ***downscaled = malloc(scaled_height * sizeof(unsigned char**));
-    for(int y = 0; y < scaled_height; y++){
-        downscaled[y] = malloc(scaled_width * sizeof(unsigned char*));
-        for(int x = 0; x < scaled_width; x++){
-            downscaled[y][x] = malloc(3 * sizeof(unsigned char));
+unsigned char* downscale_image(unsigned char *pixels, int width, int height, int scaled_width, int scaled_height){
+    unsigned char *downscaled = malloc(scaled_width * scaled_height * 3);
 
+    for(int y = 0; y < scaled_height; y++){
+        for(int x = 0; x < scaled_width; x++){
             int src_y = (y * height) / scaled_height;
             int src_x = (x * width) / scaled_width;
 
-            downscaled[y][x][0] = pixels[src_y][src_x][0];
-            downscaled[y][x][1] = pixels[src_y][src_x][1];
-            downscaled[y][x][2] = pixels[src_y][src_x][2];
+            PIXEL(downscaled, scaled_width, x, y, 0) = PIXEL(pixels, width, src_x, src_y, 0);
+            PIXEL(downscaled, scaled_width, x, y, 1) = PIXEL(pixels, width, src_x, src_y, 1);
+            PIXEL(downscaled, scaled_width, x, y, 2) = PIXEL(pixels, width, src_x, src_y, 2);
         }
     }
     return downscaled;
 }
 
-// Fast integer to string conversion (0-255 only, no bounds checking)
-// Returns number of characters written
+// fast int to string 0-255 no bounds checking
+// returns chars written
 static inline int fast_u8_to_str(unsigned char val, char *buf) {
     if (val >= 100) {
         buf[0] = '0' + (val / 100);
@@ -172,87 +166,132 @@ static inline int fast_u8_to_str(unsigned char val, char *buf) {
 }
 
 size_t calculate_frame_buffer_size(int width, int height) {
-    // Each pixel: "\033[38;2;RRR;GGG;BBBm\033[48;2;RRR;GGG;BBBm▄"
-    // Max per pixel: ~50 bytes
-    // Each row: "\033[0m\n" (6 bytes)
-    // Header: "\033[H" (3 bytes)
-    // Footer: "\033[0m" (4 bytes)
+    // worst case per pixel is both colors change:
+    //   "\033[38;2;RRR;GGG;BBB;48;2;RRR;GGG;BBBm▄"
+    //   max is 3 + 18 + 18 + 1 + 3 = 43 bytes
+    // color state tracking => most pixels skip color codes entirely
+    // for each row:
+    //   newline 1 byte
+    //   "\033[H" (3 bytes) to reset cursor position
 
     int rows = (height + 1) / 2;
-    return 3 + (rows * width * 50) + (rows * 6) + 4;
+    return 3 + (rows * width * 50) + (rows * 1) + 4;
 }
 
-void render_to_terminal_buffered(unsigned char ***pixels, int width, int height, char *frame_buffer, size_t buffer_size){
-    (void)buffer_size;  // We know it's big enough from calculate_frame_buffer_size
+void render_to_terminal_buffered(unsigned char *pixels, int width, int height, char *frame_buffer){
     char *buf = frame_buffer;
 
-    // Cursor home: "\033[H"
+    // color state tracking init
+    static int last_fg_r = -1, last_fg_g = -1, last_fg_b = -1;
+    static int last_bg_r = -1, last_bg_g = -1, last_bg_b = -1;
+
+    // cursor pos reset "\033[H"
     *buf++ = '\033';
     *buf++ = '[';
     *buf++ = 'H';
+
+    // reset state at start of frame **TODO**
+    last_fg_r = last_fg_g = last_fg_b = -1;
+    last_bg_r = last_bg_g = last_bg_b = -1;
 
     int total_rows = (height + 1) / 2;
     int current_row = 0;
 
     for(int y = 0; y < height; y += 2){
         for(int x = 0; x < width; x++){
-            unsigned char r_top = pixels[y][x][0];
-            unsigned char g_top = pixels[y][x][1];
-            unsigned char b_top = pixels[y][x][2];
+            unsigned char r_top = PIXEL(pixels, width, x, y, 0);
+            unsigned char g_top = PIXEL(pixels, width, x, y, 1);
+            unsigned char b_top = PIXEL(pixels, width, x, y, 2);
 
             unsigned char r_bot, g_bot, b_bot;
             if(y + 1 < height){
-                r_bot = pixels[y+1][x][0];
-                g_bot = pixels[y+1][x][1];
-                b_bot = pixels[y+1][x][2];
+                r_bot = PIXEL(pixels, width, x, y+1, 0);
+                g_bot = PIXEL(pixels, width, x, y+1, 1);
+                b_bot = PIXEL(pixels, width, x, y+1, 2);
             } else {
                 r_bot = g_bot = b_bot = 0;
             }
 
-            // Foreground color (bottom half): "\033[38;2;R;G;Bm"
-            *buf++ = '\033';
-            *buf++ = '[';
-            *buf++ = '3';
-            *buf++ = '8';
-            *buf++ = ';';
-            *buf++ = '2';
-            *buf++ = ';';
-            buf += fast_u8_to_str(r_bot, buf);
-            *buf++ = ';';
-            buf += fast_u8_to_str(g_bot, buf);
-            *buf++ = ';';
-            buf += fast_u8_to_str(b_bot, buf);
-            *buf++ = 'm';
+            // compare curr color state to needed
+            int fg_changed = (r_bot != last_fg_r || g_bot != last_fg_g || b_bot != last_fg_b);
+            int bg_changed = (r_top != last_bg_r || g_top != last_bg_g || b_top != last_bg_b);
 
-            // Background color (top half): "\033[48;2;R;G;Bm"
-            *buf++ = '\033';
-            *buf++ = '[';
-            *buf++ = '4';
-            *buf++ = '8';
-            *buf++ = ';';
-            *buf++ = '2';
-            *buf++ = ';';
-            buf += fast_u8_to_str(r_top, buf);
-            *buf++ = ';';
-            buf += fast_u8_to_str(g_top, buf);
-            *buf++ = ';';
-            buf += fast_u8_to_str(b_top, buf);
-            *buf++ = 'm';
+            if (fg_changed && bg_changed) {
+                *buf++ = '\033';
+                *buf++ = '[';
+                *buf++ = '3';
+                *buf++ = '8';
+                *buf++ = ';';
+                *buf++ = '2';
+                *buf++ = ';';
+                buf += fast_u8_to_str(r_bot, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(g_bot, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(b_bot, buf);
+                *buf++ = ';';
+                *buf++ = '4';
+                *buf++ = '8';
+                *buf++ = ';';
+                *buf++ = '2';
+                *buf++ = ';';
+                *buf++ = ';';
+                buf += fast_u8_to_str(g_top, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(b_top, buf);
+                *buf++ = 'm';
 
-            // Half block character (UTF-8: 0xE2 0x96 0x84)
+                last_fg_r = r_bot;
+                last_fg_g = g_bot;
+                last_fg_b = b_bot;
+                last_bg_r = r_top;
+                last_bg_g = g_top;
+                last_bg_b = b_top;
+            } else if (fg_changed) {
+                *buf++ = '\033';
+                *buf++ = '[';
+                *buf++ = '3';
+                *buf++ = '8';
+                *buf++ = ';';
+                *buf++ = '2';
+                *buf++ = ';';
+                buf += fast_u8_to_str(r_bot, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(g_bot, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(b_bot, buf);
+                *buf++ = 'm';
+
+                last_fg_r = r_bot;
+                last_fg_g = g_bot;
+                last_fg_b = b_bot;
+            } else if (bg_changed) {
+                *buf++ = '\033';
+                *buf++ = '[';
+                *buf++ = '4';
+                *buf++ = '8';
+                *buf++ = ';';
+                *buf++ = '2';
+                *buf++ = ';';
+                buf += fast_u8_to_str(r_top, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(g_top, buf);
+                *buf++ = ';';
+                buf += fast_u8_to_str(b_top, buf);
+                *buf++ = 'm';
+
+                last_bg_r = r_top;
+                last_bg_g = g_top;
+                last_bg_b = b_top;
+            }
+
+            // half block is 0xE2 0x96 0x84
             *buf++ = 0xE2;
             *buf++ = 0x96;
             *buf++ = 0x84;
         }
 
         current_row++;
-        // Reset attributes: "\033[0m"
-        *buf++ = '\033';
-        *buf++ = '[';
-        *buf++ = '0';
-        *buf++ = 'm';
-
-        // Don't add newline on the last row to prevent scrolling
         if (current_row < total_rows) {
             *buf++ = '\n';
         }
@@ -261,20 +300,20 @@ void render_to_terminal_buffered(unsigned char ***pixels, int width, int height,
     write(STDOUT_FILENO, frame_buffer, buf - frame_buffer);
 }
 
-void render_to_terminal(unsigned char ***pixels, int width, int height){
+void render_to_terminal(unsigned char *pixels, int width, int height){
     printf("\033[2J\033[H");
 
     for(int y = 0; y < height; y += 2){
         for(int x = 0; x < width; x++){
-            unsigned char r_top = pixels[y][x][0];
-            unsigned char g_top = pixels[y][x][1];
-            unsigned char b_top = pixels[y][x][2];
+            unsigned char r_top = PIXEL(pixels, width, x, y, 0);
+            unsigned char g_top = PIXEL(pixels, width, x, y, 1);
+            unsigned char b_top = PIXEL(pixels, width, x, y, 2);
 
             unsigned char r_bot, g_bot, b_bot;
             if(y + 1 < height){
-                r_bot = pixels[y+1][x][0];
-                g_bot = pixels[y+1][x][1];
-                b_bot = pixels[y+1][x][2];
+                r_bot = PIXEL(pixels, width, x, y+1, 0);
+                g_bot = PIXEL(pixels, width, x, y+1, 1);
+                b_bot = PIXEL(pixels, width, x, y+1, 2);
             } else {
                 r_bot = g_bot = b_bot = 0;
             }
@@ -290,57 +329,17 @@ void render_to_terminal(unsigned char ***pixels, int width, int height){
     fflush(stdout);
 }
 
-unsigned char*** allocate_pixel_buffer(int width, int height) {
-    unsigned char ***pixels = malloc(height * sizeof(unsigned char**));
-    if (!pixels) return NULL;
-
-    for(int y = 0; y < height; y++){
-        pixels[y] = malloc(width * sizeof(unsigned char*));
-        if (!pixels[y]) {
-            for(int cy = 0; cy < y; cy++) {
-                for(int cx = 0; cx < width; cx++) {
-                    free(pixels[cy][cx]);
-                }
-                free(pixels[cy]);
-            }
-            free(pixels);
-            return NULL;
-        }
-
-        for(int x = 0; x < width; x++){
-            pixels[y][x] = malloc(3 * sizeof(unsigned char));
-            if (!pixels[y][x]) {
-                for(int cx = 0; cx < x; cx++) {
-                    free(pixels[y][cx]);
-                }
-                for(int cy = 0; cy < y; cy++) {
-                    for(int cx = 0; cx < width; cx++) {
-                        free(pixels[cy][cx]);
-                    }
-                    free(pixels[cy]);
-                }
-                free(pixels[y]);
-                free(pixels);
-                return NULL;
-            }
-        }
-    }
-    return pixels;
+unsigned char* allocate_pixel_buffer(int width, int height) {
+    return malloc(width * height * 3);
 }
 
-void free_pixel_buffer(unsigned char ***pixels, int width, int height){
-    for(int y = 0; y < height; y++){
-        for(int x = 0; x < width; x++){
-            free(pixels[y][x]);
-        }
-        free(pixels[y]);
-    }
+void free_pixel_buffer(unsigned char *pixels){
     free(pixels);
 }
 
 void image_pipeline(const char * path){
     int width, height;
-    unsigned char ***pixels = decode_jpeg(path, &width, &height);
+    unsigned char *pixels = decode_jpeg(path, &width, &height);
 
     int term_height, term_width;
     get_terminal_size(&term_height, &term_width);
@@ -348,14 +347,14 @@ void image_pipeline(const char * path){
     int scaled_width, scaled_height;
     calculate_scaled_dimensions(width, height, term_width, term_height, &scaled_width, &scaled_height);
 
-    unsigned char ***downscaled = downscale_image(pixels, width, height, scaled_width, scaled_height);
+    unsigned char *downscaled = downscale_image(pixels, width, height, scaled_width, scaled_height);
 
     render_to_terminal(downscaled, scaled_width, scaled_height);
 
     getchar();
 
-    free_pixel_buffer(downscaled, scaled_width, scaled_height);
-    free_pixel_buffer(pixels, width, height);
+    free_pixel_buffer(downscaled);
+    free_pixel_buffer(pixels);
 }
 
 void video_pipeline(const char * path){
@@ -377,12 +376,12 @@ void video_pipeline(const char * path){
 
     size_t buffer_size = calculate_frame_buffer_size(scaled_width, scaled_height);
     char *frame_buffer = malloc(buffer_size);
-    unsigned char ***downscaled = allocate_pixel_buffer(scaled_width, scaled_height);
+    unsigned char *downscaled = allocate_pixel_buffer(scaled_width, scaled_height);
 
     if (!frame_buffer || !downscaled) {
         fprintf(stderr, "Failed to allocate playback buffers\n");
         if (frame_buffer) free(frame_buffer);
-        if (downscaled) free_pixel_buffer(downscaled, scaled_width, scaled_height);
+        if (downscaled) free_pixel_buffer(downscaled);
         video_decoder_close(decoder);
         return;
     }
@@ -404,7 +403,7 @@ void video_pipeline(const char * path){
     int frame_count = 0;
 
     // playback
-    unsigned char ***frame;
+    unsigned char *frame;
     while ((frame = video_decoder_next_frame(decoder)) != NULL && !should_exit) {
         if (benchmark_enabled) {
             gettimeofday(&start_time, NULL);
@@ -415,13 +414,13 @@ void video_pipeline(const char * path){
                 int src_y = (y * decoder->height) / scaled_height;
                 int src_x = (x * decoder->width) / scaled_width;
 
-                downscaled[y][x][0] = frame[src_y][src_x][0];
-                downscaled[y][x][1] = frame[src_y][src_x][1];
-                downscaled[y][x][2] = frame[src_y][src_x][2];
+                PIXEL(downscaled, scaled_width, x, y, 0) = PIXEL(frame, decoder->width, src_x, src_y, 0);
+                PIXEL(downscaled, scaled_width, x, y, 1) = PIXEL(frame, decoder->width, src_x, src_y, 1);
+                PIXEL(downscaled, scaled_width, x, y, 2) = PIXEL(frame, decoder->width, src_x, src_y, 2);
             }
         }
 
-        render_to_terminal_buffered(downscaled, scaled_width, scaled_height, frame_buffer, buffer_size);
+        render_to_terminal_buffered(downscaled, scaled_width, scaled_height, frame_buffer);
 
         if (benchmark_enabled) {
             gettimeofday(&end_time, NULL);
@@ -436,7 +435,7 @@ void video_pipeline(const char * path){
 
     // cleanup
     free(frame_buffer);
-    free_pixel_buffer(downscaled, scaled_width, scaled_height);
+    free_pixel_buffer(downscaled);
 
     // restore terminal
     printf("\033[?25h"); // show cursor

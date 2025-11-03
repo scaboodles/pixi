@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
@@ -147,50 +148,12 @@ VideoDecoder* video_decoder_open(const char *path) {
         return NULL;
     }
 
-    decoder->pixel_buffer = malloc(decoder->height * sizeof(unsigned char**));
+    // flat pixel buffer width * height * 3 bytes (RGB)
+    decoder->pixel_buffer = malloc(decoder->width * decoder->height * 3);
     if (!decoder->pixel_buffer) {
         fprintf(stderr, "Could not allocate pixel buffer\n");
         video_decoder_close(decoder);
         return NULL;
-    }
-
-    for (int y = 0; y < decoder->height; y++) {
-        decoder->pixel_buffer[y] = malloc(decoder->width * sizeof(unsigned char*));
-        if (!decoder->pixel_buffer[y]) {
-            fprintf(stderr, "Could not allocate pixel buffer row %d\n", y);
-            // Free already allocated rows
-            for (int cy = 0; cy < y; cy++) {
-                for (int cx = 0; cx < decoder->width; cx++) {
-                    free(decoder->pixel_buffer[cy][cx]);
-                }
-                free(decoder->pixel_buffer[cy]);
-            }
-            free(decoder->pixel_buffer);
-            decoder->pixel_buffer = NULL;
-            video_decoder_close(decoder);
-            return NULL;
-        }
-
-        for (int x = 0; x < decoder->width; x++) {
-            decoder->pixel_buffer[y][x] = malloc(3 * sizeof(unsigned char));
-            if (!decoder->pixel_buffer[y][x]) {
-                fprintf(stderr, "Could not allocate pixel at (%d, %d)\n", x, y);
-                for (int cx = 0; cx < x; cx++) {
-                    free(decoder->pixel_buffer[y][cx]);
-                }
-                for (int cy = 0; cy < y; cy++) {
-                    for (int cx = 0; cx < decoder->width; cx++) {
-                        free(decoder->pixel_buffer[cy][cx]);
-                    }
-                    free(decoder->pixel_buffer[cy]);
-                }
-                free(decoder->pixel_buffer[y]);
-                free(decoder->pixel_buffer);
-                decoder->pixel_buffer = NULL;
-                video_decoder_close(decoder);
-                return NULL;
-            }
-        }
     }
 
     printf("  Resolution: %dx%d\n", decoder->width, decoder->height);
@@ -207,12 +170,6 @@ void video_decoder_close(VideoDecoder *decoder) {
         av_packet_free(&decoder->packet);
     }
     if (decoder->pixel_buffer) {
-        for (int y = 0; y < decoder->height; y++) {
-            for (int x = 0; x < decoder->width; x++) {
-                free(decoder->pixel_buffer[y][x]);
-            }
-            free(decoder->pixel_buffer[y]);
-        }
         free(decoder->pixel_buffer);
     }
     if (decoder->sws_ctx) {
@@ -234,7 +191,7 @@ void video_decoder_close(VideoDecoder *decoder) {
     free(decoder);
 }
 
-unsigned char*** video_decoder_next_frame(VideoDecoder *decoder) {
+unsigned char* video_decoder_next_frame(VideoDecoder *decoder) {
     if (!decoder) return NULL;
 
     int ret;
@@ -248,28 +205,29 @@ unsigned char*** video_decoder_next_frame(VideoDecoder *decoder) {
             // send packet to decoder
             ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
             if (ret < 0) {
-                fprintf(stderr, "Error sending packet to decoder\n");
+                fprintf(stderr, "Warning: Packet decode error, skipping corrupted packet\n");
                 av_packet_unref(decoder->packet);
-                return NULL;
+                continue;  // bad packet go next
             }
 
             ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
             if (ret == AVERROR(EAGAIN)) {
-                // Need more packets to produce a frame
+                // need more packets to produce a frame
                 av_packet_unref(decoder->packet);
                 continue;
             } else if (ret == AVERROR_EOF) {
-                // End of video
+                // end of video
                 av_packet_unref(decoder->packet);
                 return NULL;
             } else if (ret < 0) {
-                fprintf(stderr, "Error receiving frame from decoder\n");
+                fprintf(stderr, "Warning: Frame receive error, skipping\n");
                 av_packet_unref(decoder->packet);
-                return NULL;
+                continue;  // bad frame go next
             }
-
+            // successfully got a frame => decode + color space conversion
             av_packet_unref(decoder->packet);
 
+            // convert to RGB
             sws_scale(
                 decoder->sws_ctx,
                 (const uint8_t * const*)decoder->frame->data,
@@ -283,12 +241,15 @@ unsigned char*** video_decoder_next_frame(VideoDecoder *decoder) {
             unsigned char *rgb_data = decoder->rgb_frame->data[0];
             int linesize = decoder->rgb_frame->linesize[0];
 
-            for (int y = 0; y < decoder->height; y++) {
-                for (int x = 0; x < decoder->width; x++) {
-                    int idx = y * linesize + x * 3;
-                    decoder->pixel_buffer[y][x][0] = rgb_data[idx + 0];  // R
-                    decoder->pixel_buffer[y][x][1] = rgb_data[idx + 1];  // G
-                    decoder->pixel_buffer[y][x][2] = rgb_data[idx + 2];  // B
+            // if linesize equals width*3 => no padding => fast memcpy whole thing
+            if (linesize == decoder->width * 3) {
+                memcpy(decoder->pixel_buffer, rgb_data, decoder->width * decoder->height * 3);
+            } else {
+                // handle padding => copy row by row
+                for (int y = 0; y < decoder->height; y++) {
+                    memcpy(decoder->pixel_buffer + y * decoder->width * 3,
+                           rgb_data + y * linesize,
+                           decoder->width * 3);
                 }
             }
 
