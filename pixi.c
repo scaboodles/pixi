@@ -235,6 +235,7 @@ void render_to_terminal_buffered(unsigned char *pixels, int width, int height, c
                 *buf++ = ';';
                 *buf++ = '2';
                 *buf++ = ';';
+                buf += fast_u8_to_str(r_top, buf);
                 *buf++ = ';';
                 buf += fast_u8_to_str(g_top, buf);
                 *buf++ = ';';
