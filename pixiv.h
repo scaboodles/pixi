@@ -17,6 +17,7 @@ typedef struct {
     int width;
     int height;
     double fps;
+    unsigned char ***pixel_buffer;  // Reusable buffer to avoid per-frame allocation hell
 } VideoDecoder;
 
 // open video file and set up decoder

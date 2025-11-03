@@ -4,11 +4,20 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <ncurses.h>
 #include <wchar.h>
 #include <jpeglib.h>
 #include <ctype.h>
+#include <sys/ioctl.h>
+#include <signal.h>
 #include "pixiv.h"
+
+// shutdown flag
+volatile sig_atomic_t should_exit = 0;
+
+void handle_sigint(int sig) {
+    (void)sig;
+    should_exit = 1;
+}
 
 wchar_t * lowerH = L"▄";
 
@@ -100,16 +109,14 @@ unsigned char*** decode_jpeg(const char *path, int *width, int *height){
 }
 
 void get_terminal_size(int *term_height, int *term_width){
-    initscr();
-    cbreak();
-    noecho();
-    curs_set(0);
-    getmaxyx(stdscr, *term_height, *term_width);
-    endwin();
+    struct winsize w;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+    *term_height = w.ws_row;
+    *term_width = w.ws_col;
 }
 
 void calculate_scaled_dimensions(int width, int height, int term_width, int term_height, int *scaled_width, int *scaled_height){
-    int available_height = term_height * 2;
+    int available_height = (term_height - 1) * 2;
     int available_width = term_width;
 
     float img_aspect = (float)width / (float)height;
@@ -142,17 +149,46 @@ unsigned char*** downscale_image(unsigned char ***pixels, int width, int height,
     return downscaled;
 }
 
-void render_to_terminal_buffered(unsigned char ***pixels, int width, int height){
-    size_t buffer_size = width * (height / 2) * 60 + 1000;
-    char *frame_buffer = malloc(buffer_size);
-    if (!frame_buffer) {
-        fprintf(stderr, "Failed to allocate frame buffer\n");
-        return;
+// Fast integer to string conversion (0-255 only, no bounds checking)
+// Returns number of characters written
+static inline int fast_u8_to_str(unsigned char val, char *buf) {
+    if (val >= 100) {
+        buf[0] = '0' + (val / 100);
+        buf[1] = '0' + ((val / 10) % 10);
+        buf[2] = '0' + (val % 10);
+        return 3;
+    } else if (val >= 10) {
+        buf[0] = '0' + (val / 10);
+        buf[1] = '0' + (val % 10);
+        return 2;
+    } else {
+        buf[0] = '0' + val;
+        return 1;
     }
+}
 
-    int offset = 0;
+size_t calculate_frame_buffer_size(int width, int height) {
+    // Each pixel: "\033[38;2;RRR;GGG;BBBm\033[48;2;RRR;GGG;BBBm▄"
+    // Max per pixel: ~50 bytes
+    // Each row: "\033[0m\n" (6 bytes)
+    // Header: "\033[H" (3 bytes)
+    // Footer: "\033[0m" (4 bytes)
 
-    offset += snprintf(frame_buffer + offset, buffer_size - offset, "\033[H");
+    int rows = (height + 1) / 2;
+    return 3 + (rows * width * 50) + (rows * 6) + 4;
+}
+
+void render_to_terminal_buffered(unsigned char ***pixels, int width, int height, char *frame_buffer, size_t buffer_size){
+    (void)buffer_size;  // We know it's big enough from calculate_frame_buffer_size
+    char *buf = frame_buffer;
+
+    // Cursor home: "\033[H"
+    *buf++ = '\033';
+    *buf++ = '[';
+    *buf++ = 'H';
+
+    int total_rows = (height + 1) / 2;
+    int current_row = 0;
 
     for(int y = 0; y < height; y += 2){
         for(int x = 0; x < width; x++){
@@ -169,18 +205,56 @@ void render_to_terminal_buffered(unsigned char ***pixels, int width, int height)
                 r_bot = g_bot = b_bot = 0;
             }
 
-            offset += snprintf(frame_buffer + offset, buffer_size - offset,
-                             "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm▄",
-                             r_bot, g_bot, b_bot, r_top, g_top, b_top);
+            // Foreground color (bottom half): "\033[38;2;R;G;Bm"
+            *buf++ = '\033';
+            *buf++ = '[';
+            *buf++ = '3';
+            *buf++ = '8';
+            *buf++ = ';';
+            *buf++ = '2';
+            *buf++ = ';';
+            buf += fast_u8_to_str(r_bot, buf);
+            *buf++ = ';';
+            buf += fast_u8_to_str(g_bot, buf);
+            *buf++ = ';';
+            buf += fast_u8_to_str(b_bot, buf);
+            *buf++ = 'm';
+
+            // Background color (top half): "\033[48;2;R;G;Bm"
+            *buf++ = '\033';
+            *buf++ = '[';
+            *buf++ = '4';
+            *buf++ = '8';
+            *buf++ = ';';
+            *buf++ = '2';
+            *buf++ = ';';
+            buf += fast_u8_to_str(r_top, buf);
+            *buf++ = ';';
+            buf += fast_u8_to_str(g_top, buf);
+            *buf++ = ';';
+            buf += fast_u8_to_str(b_top, buf);
+            *buf++ = 'm';
+
+            // Half block character (UTF-8: 0xE2 0x96 0x84)
+            *buf++ = 0xE2;
+            *buf++ = 0x96;
+            *buf++ = 0x84;
         }
-        offset += snprintf(frame_buffer + offset, buffer_size - offset, "\033[0m\n");
+
+        current_row++;
+        // Reset attributes: "\033[0m"
+        *buf++ = '\033';
+        *buf++ = '[';
+        *buf++ = '0';
+        *buf++ = 'm';
+
+        // Don't add newline on the last row to prevent scrolling
+        if (current_row < total_rows) {
+            *buf++ = '\n';
+        }
     }
 
-    offset += snprintf(frame_buffer + offset, buffer_size - offset, "\033[0m");
-
-    write(STDOUT_FILENO, frame_buffer, offset);
-
-    free(frame_buffer);
+    write(STDOUT_FILENO, frame_buffer, buf - frame_buffer);
 }
 
 void render_to_terminal(unsigned char ***pixels, int width, int height){
@@ -210,6 +284,44 @@ void render_to_terminal(unsigned char ***pixels, int width, int height){
 
     printf("\033[0m");
     fflush(stdout);
+}
+
+unsigned char*** allocate_pixel_buffer(int width, int height) {
+    unsigned char ***pixels = malloc(height * sizeof(unsigned char**));
+    if (!pixels) return NULL;
+
+    for(int y = 0; y < height; y++){
+        pixels[y] = malloc(width * sizeof(unsigned char*));
+        if (!pixels[y]) {
+            for(int cy = 0; cy < y; cy++) {
+                for(int cx = 0; cx < width; cx++) {
+                    free(pixels[cy][cx]);
+                }
+                free(pixels[cy]);
+            }
+            free(pixels);
+            return NULL;
+        }
+
+        for(int x = 0; x < width; x++){
+            pixels[y][x] = malloc(3 * sizeof(unsigned char));
+            if (!pixels[y][x]) {
+                for(int cx = 0; cx < x; cx++) {
+                    free(pixels[y][cx]);
+                }
+                for(int cy = 0; cy < y; cy++) {
+                    for(int cx = 0; cx < width; cx++) {
+                        free(pixels[cy][cx]);
+                    }
+                    free(pixels[cy]);
+                }
+                free(pixels[y]);
+                free(pixels);
+                return NULL;
+            }
+        }
+    }
+    return pixels;
 }
 
 void free_pixel_buffer(unsigned char ***pixels, int width, int height){
@@ -251,7 +363,7 @@ void video_pipeline(const char * path){
 
     int term_height, term_width;
     get_terminal_size(&term_height, &term_width);
-
+    printf("Terminal resolution: %d x %d\n", term_width, 2 * term_height);
     int scaled_width, scaled_height;
     calculate_scaled_dimensions(decoder->width, decoder->height,
                                 term_width, term_height,
@@ -259,33 +371,63 @@ void video_pipeline(const char * path){
 
     int frame_delay_us = (int)(1000000.0 / decoder->fps);
 
+    size_t buffer_size = calculate_frame_buffer_size(scaled_width, scaled_height);
+    char *frame_buffer = malloc(buffer_size);
+    unsigned char ***downscaled = allocate_pixel_buffer(scaled_width, scaled_height);
+
+    if (!frame_buffer || !downscaled) {
+        fprintf(stderr, "Failed to allocate playback buffers\n");
+        if (frame_buffer) free(frame_buffer);
+        if (downscaled) free_pixel_buffer(downscaled, scaled_width, scaled_height);
+        video_decoder_close(decoder);
+        return;
+    }
+
     printf("Starting playback... (Press Ctrl+C to stop)\n");
     sleep(1);
 
+    signal(SIGINT, handle_sigint);
+
+    // alternate screen buffer init
     printf("\033[?1049h");
-    printf("\033[?25l");
-    printf("\033[2J");
+    printf("\033[?25l");// hide cursor
+    printf("\033[2J");// clear
     fflush(stdout);
 
+    // playback
     unsigned char ***frame;
-    while ((frame = video_decoder_next_frame(decoder)) != NULL) {
-        unsigned char ***downscaled = downscale_image(frame,
-                                                      decoder->width, decoder->height,
-                                                      scaled_width, scaled_height);
+    while ((frame = video_decoder_next_frame(decoder)) != NULL && !should_exit) {
+        for(int y = 0; y < scaled_height; y++){
+            for(int x = 0; x < scaled_width; x++){
+                int src_y = (y * decoder->height) / scaled_height;
+                int src_x = (x * decoder->width) / scaled_width;
 
-        render_to_terminal_buffered(downscaled, scaled_width, scaled_height);
+                downscaled[y][x][0] = frame[src_y][src_x][0];
+                downscaled[y][x][1] = frame[src_y][src_x][1];
+                downscaled[y][x][2] = frame[src_y][src_x][2];
+            }
+        }
 
-        free_pixel_buffer(downscaled, scaled_width, scaled_height);
-        free_pixel_buffer(frame, decoder->width, decoder->height);
+        render_to_terminal_buffered(downscaled, scaled_width, scaled_height, frame_buffer, buffer_size);
 
-        usleep(frame_delay_us);
+
+        //usleep(frame_delay_us);
     }
 
-    printf("\033[?25h");
+    // cleanup
+    free(frame_buffer);
+    free_pixel_buffer(downscaled, scaled_width, scaled_height);
+
+    // restore terminal
+    printf("\033[?25h"); // show cursor
     printf("\033[?1049l");
     fflush(stdout);
 
-    printf("Playback finished!\n");
+    if (should_exit) {
+        printf("Playback interrupted by user.\n");
+    } else {
+        printf("Playback finished!\n");
+    }
 
     video_decoder_close(decoder);
 }

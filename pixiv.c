@@ -18,6 +18,7 @@ VideoDecoder* video_decoder_open(const char *path) {
     decoder->frame = NULL;
     decoder->rgb_frame = NULL;
     decoder->packet = NULL;
+    decoder->pixel_buffer = NULL;
     decoder->video_stream_index = -1;
 
     int ret;
@@ -146,7 +147,52 @@ VideoDecoder* video_decoder_open(const char *path) {
         return NULL;
     }
 
-    printf("Video opened successfully:\n");
+    decoder->pixel_buffer = malloc(decoder->height * sizeof(unsigned char**));
+    if (!decoder->pixel_buffer) {
+        fprintf(stderr, "Could not allocate pixel buffer\n");
+        video_decoder_close(decoder);
+        return NULL;
+    }
+
+    for (int y = 0; y < decoder->height; y++) {
+        decoder->pixel_buffer[y] = malloc(decoder->width * sizeof(unsigned char*));
+        if (!decoder->pixel_buffer[y]) {
+            fprintf(stderr, "Could not allocate pixel buffer row %d\n", y);
+            // Free already allocated rows
+            for (int cy = 0; cy < y; cy++) {
+                for (int cx = 0; cx < decoder->width; cx++) {
+                    free(decoder->pixel_buffer[cy][cx]);
+                }
+                free(decoder->pixel_buffer[cy]);
+            }
+            free(decoder->pixel_buffer);
+            decoder->pixel_buffer = NULL;
+            video_decoder_close(decoder);
+            return NULL;
+        }
+
+        for (int x = 0; x < decoder->width; x++) {
+            decoder->pixel_buffer[y][x] = malloc(3 * sizeof(unsigned char));
+            if (!decoder->pixel_buffer[y][x]) {
+                fprintf(stderr, "Could not allocate pixel at (%d, %d)\n", x, y);
+                for (int cx = 0; cx < x; cx++) {
+                    free(decoder->pixel_buffer[y][cx]);
+                }
+                for (int cy = 0; cy < y; cy++) {
+                    for (int cx = 0; cx < decoder->width; cx++) {
+                        free(decoder->pixel_buffer[cy][cx]);
+                    }
+                    free(decoder->pixel_buffer[cy]);
+                }
+                free(decoder->pixel_buffer[y]);
+                free(decoder->pixel_buffer);
+                decoder->pixel_buffer = NULL;
+                video_decoder_close(decoder);
+                return NULL;
+            }
+        }
+    }
+
     printf("  Resolution: %dx%d\n", decoder->width, decoder->height);
     printf("  FPS: %.2f\n", decoder->fps);
     printf("  Codec: %s\n", codec->name);
@@ -159,6 +205,15 @@ void video_decoder_close(VideoDecoder *decoder) {
 
     if (decoder->packet) {
         av_packet_free(&decoder->packet);
+    }
+    if (decoder->pixel_buffer) {
+        for (int y = 0; y < decoder->height; y++) {
+            for (int x = 0; x < decoder->width; x++) {
+                free(decoder->pixel_buffer[y][x]);
+            }
+            free(decoder->pixel_buffer[y]);
+        }
+        free(decoder->pixel_buffer);
     }
     if (decoder->sws_ctx) {
         sws_freeContext(decoder->sws_ctx);
@@ -225,53 +280,19 @@ unsigned char*** video_decoder_next_frame(VideoDecoder *decoder) {
                 decoder->rgb_frame->linesize
             );
 
-            unsigned char ***pixels = malloc(decoder->height * sizeof(unsigned char**));
-            if (!pixels) {
-                fprintf(stderr, "Failed to allocate pixel array\n");
-                return NULL;
-            }
-
             unsigned char *rgb_data = decoder->rgb_frame->data[0];
             int linesize = decoder->rgb_frame->linesize[0];
 
             for (int y = 0; y < decoder->height; y++) {
-                pixels[y] = malloc(decoder->width * sizeof(unsigned char*));
-                if (!pixels[y]) {
-                    for (int cy = 0; cy < y; cy++) {
-                        for (int cx = 0; cx < decoder->width; cx++) {
-                            free(pixels[cy][cx]);
-                        }
-                        free(pixels[cy]);
-                    }
-                    free(pixels);
-                    return NULL;
-                }
-
                 for (int x = 0; x < decoder->width; x++) {
-                    pixels[y][x] = malloc(3 * sizeof(unsigned char));
-                    if (!pixels[y][x]) {
-                        for (int cx = 0; cx < x; cx++) {
-                            free(pixels[y][cx]);
-                        }
-                        for (int cy = 0; cy < y; cy++) {
-                            for (int cx = 0; cx < decoder->width; cx++) {
-                                free(pixels[cy][cx]);
-                            }
-                            free(pixels[cy]);
-                        }
-                        free(pixels[y]);
-                        free(pixels);
-                        return NULL;
-                    }
-
                     int idx = y * linesize + x * 3;
-                    pixels[y][x][0] = rgb_data[idx + 0];  // R
-                    pixels[y][x][1] = rgb_data[idx + 1];  // G
-                    pixels[y][x][2] = rgb_data[idx + 2];  // B
+                    decoder->pixel_buffer[y][x][0] = rgb_data[idx + 0];  // R
+                    decoder->pixel_buffer[y][x][1] = rgb_data[idx + 1];  // G
+                    decoder->pixel_buffer[y][x][2] = rgb_data[idx + 2];  // B
                 }
             }
 
-            return pixels;
+            return decoder->pixel_buffer;
         }
 
         // not video packet
