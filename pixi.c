@@ -9,10 +9,14 @@
 #include <ctype.h>
 #include <sys/ioctl.h>
 #include <signal.h>
+#include <sys/time.h>
 #include "pixiv.h"
 
 // shutdown flag
 volatile sig_atomic_t should_exit = 0;
+
+// benchmark flag
+int benchmark_enabled = 0;
 
 void handle_sigint(int sig) {
     (void)sig;
@@ -394,9 +398,18 @@ void video_pipeline(const char * path){
     printf("\033[2J");// clear
     fflush(stdout);
 
+    // benchmark variables
+    struct timeval start_time, end_time;
+    long total_time_us = 0;
+    int frame_count = 0;
+
     // playback
     unsigned char ***frame;
     while ((frame = video_decoder_next_frame(decoder)) != NULL && !should_exit) {
+        if (benchmark_enabled) {
+            gettimeofday(&start_time, NULL);
+        }
+
         for(int y = 0; y < scaled_height; y++){
             for(int x = 0; x < scaled_width; x++){
                 int src_y = (y * decoder->height) / scaled_height;
@@ -410,6 +423,13 @@ void video_pipeline(const char * path){
 
         render_to_terminal_buffered(downscaled, scaled_width, scaled_height, frame_buffer, buffer_size);
 
+        if (benchmark_enabled) {
+            gettimeofday(&end_time, NULL);
+            long elapsed_us = (end_time.tv_sec - start_time.tv_sec) * 1000000L +
+                             (end_time.tv_usec - start_time.tv_usec);
+            total_time_us += elapsed_us;
+            frame_count++;
+        }
 
         //usleep(frame_delay_us);
     }
@@ -429,16 +449,44 @@ void video_pipeline(const char * path){
         printf("Playback finished!\n");
     }
 
+    // print benchmark results
+    if (benchmark_enabled && frame_count > 0) {
+        double avg_time_ms = (double)total_time_us / (double)frame_count / 1000.0;
+        double avg_fps = 1000.0 / avg_time_ms;
+        printf("\nBenchmark Results:\n");
+        printf("  Total frames processed: %d\n", frame_count);
+        printf("  Average time per frame: %.3f ms\n", avg_time_ms);
+        printf("  Average FPS: %.2f\n", avg_fps);
+        printf("  Total processing time: %.3f s\n", (double)total_time_us / 1000000.0);
+    }
+
     video_decoder_close(decoder);
 }
 
 int main(int argc, char * args[]){
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <image_or_video_file>\n", args[0]);
+        fprintf(stderr, "Usage: %s [--benchmark] <image_or_video_file>\n", args[0]);
+        fprintf(stderr, "Options:\n");
+        fprintf(stderr, "  --benchmark    Enable benchmark mode (video only)\n");
         return 1;
     }
 
-    const char * path = args[1];
+    const char * path = NULL;
+
+    // parse arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(args[i], "--benchmark") == 0 || strcmp(args[i], "-b") == 0) {
+            benchmark_enabled = 1;
+        } else {
+            path = args[i];
+        }
+    }
+
+    if (!path) {
+        fprintf(stderr, "Error: No file specified\n");
+        fprintf(stderr, "Usage: %s [--benchmark] <image_or_video_file>\n", args[0]);
+        return 1;
+    }
 
     FileType file_type = detect_file_type(path);
 
